@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+from protocol import *
+
+ctx = build_context()
+
+d = check(ctx)
+
+for (id, p) in sorted(d.items()):
+    if (p.define != None):
+        # id & 0xff, id >> 8
+        print "%04x:%s" % (id, -1 if isinstance(p,VarPacket)
+            else p.fixed_struct.size)
+

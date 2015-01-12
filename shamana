@@ -1,0 +1,926 @@
+#!/bin/sh
+# shamana * downgraded tmw sh client
+# coproright * wtfpl * 2ols * willee
+
+# requirements: nc, timeout (or replace with read/line -t), od
+#               using GNU coreutils date and stat args format
+#               tcc and readline for readline input support
+
+config=
+fifo="in"
+hub_fifo="hub"
+pub_fifo="pub"
+raw_in="raw_in"
+raw_out="raw_out"
+
+server="localhost"
+port=6901
+login='user1'
+password='user1p'
+charslot=0
+charname='user1c1'
+# master -> nick per line; single nick is obviously valid
+master="farmer"
+# master=$( tmww list dump master.list 2>/dev/null )
+hub="guild"
+active_master=          # empty by default
+pid_file=pid            # default file name for pid file
+
+hub_skip_prefix=1       # strip nick prefixes
+cached_ids_limit=200    # limit cached player names
+
+delay_chat=2            # safe whisper delay, server warning are not checked 
+penalty_chat=12         # spam protection penalty
+spam_chat=spam_chat     # timestamp file for chat spam
+sit_delay=60            # sit every N seconds
+
+# default settings
+relay_p=; relay_w=; relay_v=
+master_p=; master_w=; master_h=; master_v=
+console_i=1; console_p=1; console_w=1; console_m=1
+console_h=1; console_r=1; console_b=1; console_o=1
+console_g=1
+target="pub"
+safe_detault=1
+
+# debug_input=1       # dump input packets
+# debug_output=1      # dump output packets
+# debug_service=1     # show service messages
+
+echo_input() { [ -n "${debug_input}" ] && printf "%s\n" "$*" ; }
+echo_out() { if [ -n "${debug_output}" ]; then tee "${raw_out}" | hd; else cat > "${raw_out}" ; fi; }
+echo_service() { [ -n "${debug_service}" ] && printf "%s %s\n" "$(date +%H-%M-%S.%3N)" "$*" ; }
+
+#
+# opts
+#
+#
+
+AWK=$( command -v mawk 2>/dev/null )
+AWK="${AWK:-awk}"
+
+fatal() { printf >&2 "FATAL %s\n" "$*" ; kill 0; }
+
+run_readline() {
+    # can't run tcc with options (lreadline) and heredoc
+    rlfile=$( mktemp rl_XXXXXX.c )
+    cat > "${rlfile}" <<-'RL'
+    #include <stdlib.h>
+    #include <readline/readline.h>
+
+    void main()
+    {
+        char* i;
+        while (i = readline("> ")) {
+            add_history(i);
+            fprintf(stderr,"%s\n", i);
+            free(i);
+        }
+    }
+RL
+    tcc -lreadline -run "${rlfile}" 2>"${fifo}"
+}
+
+shmn_attach=; shmn_readline=; shmn_cat=; shmn_hub=; shmn_pub=; shmn_k=
+OPTIND=1
+while getopts i:arcf:hpy:k: opt; do
+    case "${opt}" in
+        i)  fifo="${OPTARG:-in}" ;;
+        a)  shmn_attach=1 ;;
+        r)  shmn_readline=1 ;;
+        c)  shmn_cat=1 ;;
+        h)  shmn_hub=1 ;;
+        p)  shmn_pub=1 ;;
+        f)  . "${OPTARG}" ;; # override defaults with custom config
+        y)  pid_file="${OPTARG:-pid}" ;;
+        k)  shmn_k="${OPTARG}" ;;
+    esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+if [ -n "$1" ]; then
+    printf "%s\n" "$*" > "${fifo}" # write all extra args to active fifo
+    exit 0
+fi
+
+echo $$ > "${pid_file}"
+
+color_off=$( tput op ); color_red=$( tput setaf 1 )
+color_green=$( tput setaf 2 ); color_yellow=$(tput setaf 3 )
+color_blue=$( tput setaf 4 ); color_magenta=$( tput setaf 5 )
+color_cyan=$( tput setaf 6 ); color_orange=$( tput setaf 9 )
+
+if [ -n "${shmn_k}" ]; then
+    trap 'kill 0' INT TERM EXIT
+    tail -f "${shmn_k}" | sed "
+    /^[^~]/d
+    s/~i/${color_yellow}&/
+    s/~p/${color_green}&/
+    s/~w/${color_blue}&/
+    s/~m/${color_magenta}&/
+    s/~h/${color_cyan}&/
+    s/~o/${color_grey}&/
+    s/~r/${color_grey}&/
+    s/~b/${color_grey}&/
+    s/$/${color_off}/
+    "
+    exit 0
+fi
+
+if [ -n "${shmn_attach}" ]; then
+    [ -p "${fifo}" ] || fatal "FIFO \"${fifo}\" does not exist!"
+    if [ -n "${shmn_readline}" ]; then
+        trap 'rm -f "${rlfile}"' INT TERM EXIT
+        run_readline
+    else
+        cat > "${fifo}"
+    fi
+    exit 0
+fi
+
+#
+# network
+#
+#
+
+CMSG_CHAR_PASSWORD_CHANGE="0061"; SMSG_CHAR_PASSWORD_RESPONSE="0062"
+SMSG_UPDATE_HOST="0063"; CMSG_LOGIN_REGISTER="0064"
+CMSG_CHAR_SERVER_CONNECT="0065"; CMSG_CHAR_SELECT="0066"
+CMSG_CHAR_CREATE="0067"; CMSG_CHAR_DELETE="0068"
+SMSG_LOGIN_DATA="0069"; SMSG_LOGIN_ERROR="006a"
+SMSG_CHAR_LOGIN="006b"; SMSG_CHAR_LOGIN_ERROR="006c"
+SMSG_CHAR_CREATE_SUCCEEDED="006d"; SMSG_CHAR_CREATE_FAILED="006e"
+SMSG_CHAR_DELETE_SUCCEEDED="006f"; SMSG_CHAR_DELETE_FAILED="0070"
+SMSG_CHAR_MAP_INFO="0071"; CMSG_MAP_SERVER_CONNECT="0072"
+SMSG_MAP_LOGIN_SUCCESS="0073"; SMSG_BEING_VISIBLE="0078"
+SMSG_BEING_MOVE="007b"; SMSG_BEING_SPAWN="007c"
+CMSG_MAP_LOADED="007d"; CMSG_MAP_PING="007e"
+SMSG_SERVER_PING="007f"; SMSG_BEING_REMOVE="0080"
+SMSG_CONNECTION_PROBLEM="0081"; CMSG_PLAYER_CHANGE_DEST="0085"
+SMSG_WALK_RESPONSE="0087"; SMSG_PLAYER_STOP="0088"
+CMSG_PLAYER_CHANGE_ACT="0089"; SMSG_BEING_ACTION="008a"
+CMSG_CHAT_MESSAGE="008c"; SMSG_BEING_CHAT="008d"
+SMSG_PLAYER_CHAT="008e"; CMSG_NPC_TALK="0090"
+SMSG_PLAYER_WARP="0091"; SMSG_CHANGE_MAP_SERVER="0092"
+CMSG_NAME_REQUEST="0094"; SMSG_BEING_NAME_RESPONSE="0095"
+CMSG_CHAT_WHISPER="0096"; SMSG_WHISPER="0097"
+SMSG_WHISPER_RESPONSE="0098"; SMSG_GM_CHAT="009a"
+CMSG_PLAYER_CHANGE_DIR="009b"; SMSG_BEING_CHANGE_DIRECTION="009c"
+SMSG_ITEM_VISIBLE="009d"; SMSG_ITEM_DROPPED="009e"
+CMSG_ITEM_PICKUP="009f"; SMSG_PLAYER_INVENTORY_ADD="00a0"
+SMSG_ITEM_REMOVE="00a1"; CMSG_PLAYER_INVENTORY_DROP="00a2"
+SMSG_PLAYER_EQUIPMENT="00a4"; SMSG_PLAYER_STORAGE_EQUIP="00a6"
+CMSG_PLAYER_INVENTORY_USE="00a7"; SMSG_ITEM_USE_RESPONSE="00a8"
+CMSG_PLAYER_EQUIP="00a9"; SMSG_PLAYER_EQUIP="00aa"
+CMSG_PLAYER_UNEQUIP="00ab"; SMSG_PLAYER_UNEQUIP="00ac"
+SMSG_PLAYER_INVENTORY_REMOVE="00af"; SMSG_PLAYER_STAT_UPDATE_1="00b0"
+SMSG_PLAYER_STAT_UPDATE_2="00b1"; CMSG_PLAYER_REBOOT="00b2"
+SMSG_CHAR_SWITCH_RESPONSE="00b3"; SMSG_NPC_MESSAGE="00b4"
+SMSG_NPC_NEXT="00b5"; SMSG_NPC_CLOSE="00b6"
+SMSG_NPC_CHOICE="00b7"; CMSG_NPC_LIST_CHOICE="00b8"
+CMSG_NPC_NEXT_REQUEST="00b9"; CMSG_STAT_UPDATE_REQUEST="00bb"
+SMSG_PLAYER_STAT_UPDATE_4="00bc"; SMSG_PLAYER_STAT_UPDATE_5="00bd"
+SMSG_PLAYER_STAT_UPDATE_6="00be"; CMSG_PLAYER_EMOTE="00bf"
+SMSG_BEING_EMOTION="00c0"; SMSG_NPC_BUY_SELL_CHOICE="00c4"
+CMSG_NPC_BUY_SELL_REQUEST="00c5"; SMSG_NPC_BUY="00c6"
+SMSG_NPC_SELL="00c7"; CMSG_NPC_BUY_REQUEST="00c8"
+CMSG_NPC_SELL_REQUEST="00c9"; SMSG_NPC_BUY_RESPONSE="00ca"
+SMSG_NPC_SELL_RESPONSE="00cb"; SMSG_ADMIN_KICK_ACK="00cd"
+CMSG_TRADE_REQUEST="00e4"; SMSG_TRADE_REQUEST="00e5"
+CMSG_TRADE_RESPONSE="00e6"; SMSG_TRADE_RESPONSE="00e7"
+CMSG_TRADE_ITEM_ADD_REQUEST="00e8"; SMSG_TRADE_ITEM_ADD="00e9"
+CMSG_TRADE_ADD_COMPLETE="00eb"; SMSG_TRADE_OK="00ec"
+CMSG_TRADE_CANCEL_REQUEST="00ed"; SMSG_TRADE_CANCEL="00ee"
+CMSG_TRADE_OK="00ef"; SMSG_TRADE_COMPLETE="00f0"
+SMSG_PLAYER_STORAGE_STATUS="00f2"; CMSG_MOVE_TO_STORAGE="00f3"
+SMSG_PLAYER_STORAGE_ADD="00f4"; CSMG_MOVE_FROM_STORAGE="00f5"
+SMSG_PLAYER_STORAGE_REMOVE="00f6"; CMSG_CLOSE_STORAGE="00f7"
+SMSG_PLAYER_STORAGE_CLOSE="00f8"; CMSG_PARTY_CREATE="00f9"
+SMSG_PARTY_CREATE="00fa"; SMSG_PARTY_INFO="00fb"
+CMSG_PARTY_INVITE="00fc"; SMSG_PARTY_INVITE_RESPONSE="00fd"
+SMSG_PARTY_INVITED="00fe"; CMSG_PARTY_INVITED="00ff"
+CMSG_PARTY_LEAVE="0100"; SMSG_PARTY_SETTINGS="0101"
+CMSG_PARTY_SETTINGS="0102"; CMSG_PARTY_KICK="0103"
+SMSG_PARTY_LEAVE="0105"; SMSG_PARTY_UPDATE_HP="0106"
+SMSG_PARTY_UPDATE_COORDS="0107"; CMSG_PARTY_MESSAGE="0108"
+SMSG_PARTY_MESSAGE="0109"; SMSG_PLAYER_SKILL_UP="010e"
+SMSG_PLAYER_SKILLS="010f"; SMSG_SKILL_FAILED="0110"
+CMSG_SKILL_LEVELUP_REQUEST="0112"; CMSG_PLAYER_STOP_ATTACK="0118"
+SMSG_PLAYER_STATUS_CHANGE="0119"; SMSG_PLAYER_MOVE_TO_ATTACK="0139"
+SMSG_PLAYER_ATTACK_RANGE="013a"; SMSG_PLAYER_ARROW_MESSAGE="013b"
+SMSG_PLAYER_ARROW_EQUIP="013c"; SMSG_PLAYER_STAT_UPDATE_3="0141"
+SMSG_NPC_INT_INPUT="0142"; CMSG_NPC_INT_RESPONSE="0143"
+CMSG_NPC_CLOSE="0146"; SMSG_BEING_RESURRECT="0148"
+CMSG_CLIENT_QUIT="018a"; SMSG_MAP_QUIT_RESPONSE="018b"
+SMSG_PLAYER_GUILD_PARTY_INFO="0195"; SMSG_BEING_STATUS_CHANGE="0196"
+SMSG_BEING_SELFEFFECT="019b"; SMSG_TRADE_ITEM_ADD_RESPONSE="01b1"
+SMSG_PLAYER_INVENTORY_USE="01c8"; SMSG_NPC_STR_INPUT="01d4"
+CMSG_NPC_STR_RESPONSE="01d5"; SMSG_BEING_CHANGE_LOOKS2="01d7"
+SMSG_PLAYER_UPDATE_1="01d8"; SMSG_PLAYER_UPDATE_2="01d9"
+SMSG_PLAYER_MOVE="01da"; SMSG_SKILL_DAMAGE="01de"
+SMSG_PLAYER_INVENTORY="01ee"; SMSG_PLAYER_STORAGE_ITEMS="01f0"
+SMSG_BEING_IP_RESPONSE="020c"; SMSG_NPC_COMMAND="0212"
+
+packets="
+0061:50  0062:3   0063:-1   0064:55  0065:17   0066:3   0067:37  0068:46
+0069:-1  006a:23  006b:-1   006c:3   006d:108  006e:3   006f:2   0070:3
+0071:28  0072:19  0073:11   0078:54  007b:60   007c:41  007d:2   007e:6
+007f:6   0080:7   0081:3    0085:5   0087:12   0088:10  0089:7   008a:29
+008c:-1  008d:-1  008e:-1   0090:7   0091:22   0092:28  0094:6   0095:30
+0096:-1  0097:-1  0098:3    009a:-1  009b:5    009c:9   009d:17  009e:17
+009f:6   00a0:23  00a1:6    00a2:6   00a4:-1   00a6:-1  00a7:8   00a8:7
+00a9:6   00aa:7   00ab:4    00ac:7   00af:6    00b0:8   00b1:8   00b2:3
+00b3:3   00b4:-1  00b5:6    00b6:6   00b7:-1   00b8:7   00b9:6   00bb:5
+00bc:6   00bd:44  00be:5    00bf:3   00c0:7    00c4:6   00c5:7   00c6:-1
+00c7:-1  00c8:-1  00c9:-1   00ca:3   00cb:3    00cd:6   00e4:6   00e5:26
+00e6:3   00e7:3   00e8:8    00e9:19  00eb:2    00ec:3   00ed:2   00ee:2
+00ef:2   00f0:3   00f2:6    00f3:8   00f4:21   00f5:8   00f6:8   00f7:2
+00f8:2   00f9:26  00fa:3    00fb:-1  00fc:6    00fd:27  00fe:30  00ff:10
+0100:2   0101:6   0102:6    0103:30  0105:31   0106:10  0107:10  0108:-1
+0109:-1  010e:11  010f:-1   0110:10  0112:4    0118:2   0119:13  0139:16
+013a:4   013b:4   013c:4    0141:14  0142:6    0143:10  0146:6   0148:8
+018a:4   018b:4   0195:102  0196:9   019b:10   01b1:7   01c8:13  01d4:6
+01d5:-1  01d7:11  01d8:54   01d9:53  01da:60   01de:33  01ee:-1  01f0:-1
+020c:10  0212:16
+"
+
+packets=$( printf "%s\n" "${packets}" | tr -s ' ' '\n' | tr -s '\n' )
+
+packet= # extracted packet per line in hex lowercase digits: xxxx[ xx]+
+packet_id= # extracted packet's id: xxxx
+visible= # list of visible players
+players= # list of cached ids: " xx xx xx xx Player name"
+
+# print N chars
+# 1 -- N
+# 2 -- char
+nchar() { i=$1; while [ $i -gt 0 ]; do printf "$2"; i=$(( $i - 1)); done; }
+
+# print zero-padded utf string
+# 1 -- N pad width
+# 2 -- string
+# non-utf variant
+# pad() { printf "%s" "$2"; nchar $(( $1 - ${#2} )) "\0"; }
+pad() { printf "%s" "$2"; nchar $(( $1 - $( printf "%s" "$2" | wc -c ) )) "\0"; }
+
+# output bytes by hex/dec code
+# example: bytes 0x64 100 | hd
+# debian/dash is buggy: can't printf \0 with %b
+bytes() { eval printf $( printf "\\\\\\\\%03o" "$@" ); }
+
+# same like bytes omitting 0x prefix
+hex() { eval printf $( printf "\\\\\\\\%03o" $( printf "0x%s " "$@" ) ); }
+
+# packet id of xxxx (hex) format; use with hex function
+id2hex() { printf "%s %s" "${1#??}" "${1%??}" ; }
+
+# convert decimal < 65536 to normalized hex() input
+# 1 -- decimal
+dec2hex() { len=$( echo "obase=16;$1" | bc );
+    [ "${#len}" -gt 2 ] && len="${len#??} ${len%??}" || len="${len} 00" ;
+    printf "%s" "${len}"; }
+
+# slice bytes from packet buffer
+# 1 -- start byte
+# 2 -- length
+slice() { expr substr "${packet}" \( $1 \* 3 - 1 \) \( $2 \* 3 \) ; }
+
+# get string from packet
+# 1 -- start byte
+# 2 -- optional bytes size limit (string stops at first 00 )
+string() { local s; s=$( expr substr "${packet}" \( $1 \* 3 - 1 \) \( ${2:-500} \* 3 \) )
+    s="${s%% 00*}"; hex $s ; }
+
+# read encoded packet, set packet id
+next_packet() {
+    while read packet < "${raw_in}" ; do
+        [ -n "${packet}" ] && break
+    done
+    packet_id="${packet%% *}"
+}
+
+# 1+ -- message ids
+expect() {
+    while :; do
+        next_packet
+        for i in "$@"; do
+            [ "${packet_id}" = "${i}" ] && return
+        done
+    done
+}
+
+# encode packets to shell readable form
+# 1 -- port (if no - using default ${port} )
+connect() {
+[ -p "${raw_in}" ] && { rm -f "${raw_in}" || fatal "Can't reuse fifo!" ; }
+mkfifo "${raw_in}"
+[ -p "${raw_out}" ] && { rm -f "${raw_out}" || fatal "Can't reuse fifo!" ; }
+mkfifo "${raw_out}"
+sleep 1
+( exec 3<>"${raw_out}"; { while :; do cat <&3 2>/dev/null;
+    echo >&4 "Fatal. Netcat pipe closed."; kill 0; done; } |
+    nc "${server}" "${1:-${port}}" 2>/dev/null | {
+    [ -n "$1" ] && dd bs=4 count=1 >/dev/null 2>&1
+    while :; do
+        buffer=
+        p_id=$( dd bs=2 count=1 2>/dev/null | od -An -tx2 )
+        p_id="${p_id# }"
+        [ -z "${p_id}" ] && fatal "Undefined packet"
+        len=$( printf "%s\n" "${packets}" | grep "${p_id}" )
+        len="${len#?????}"
+        echo_service "> " p_id "${p_id}" len "${len}"
+        [ -z "${len}" ] && fatal "Packet error"
+        if [ "${len}" = "-1" ]; then
+            buffer=$( dd bs=2 count=1 2>/dev/null | od -An -tx1 )
+            len=$(( $( hex ${buffer} | od -An -td2 ) - 2 ))
+            echo_input adj len "${len}" "${buffer}"
+        fi
+        if [ -n "${len}" ]; then
+            buffer="${buffer}"$( dd bs=1 count=$(( ${len} - 2 )) 2>/dev/null |
+                od -vAn -tx1 )
+        fi
+
+        echo_input debug
+        echo_input "${buffer}"
+        printf "%s%s\n" "${p_id}" "${buffer}" | tr '\n' ' ' > "${raw_in}"
+        echo > "${raw_in}"
+    done ; }
+    echo "Fatal: ${server}:${1:-${port}} connection bricked!"
+    echo "fifo trace:"
+    cat "${fifo}"
+    echo 'done.'
+    kill 0
+) 4>&1 2>/dev/null & pid=$!
+}
+
+disconnect() { kill -9 "${pid}" || fatal "Connection process kill failed!";
+    rm -f "${raw_in}" "${raw_out}"
+}
+
+# send/parse function names are relevant lowercased packet names
+
+# 1 -- login
+# 2 -- password
+send_login_register() { { hex $( id2hex "${CMSG_LOGIN_REGISTER}" ) 0 0 0 0;
+    pad 24 "$1"; pad 24 "$2"; hex 3; } | echo_out ; }
+
+parse_login_data() { id1=$( slice 4 4); accid=$( slice 8 4 ); id2=$( slice 12 4 );
+    sex=$( slice 47 1 ); char_port=$( hex $( slice 52 2 ) | od -An -td2 ) ; }
+
+send_char_server_connect() { { hex $( id2hex "${CMSG_CHAR_SERVER_CONNECT}" ) \
+    ${accid} ${id1} ${id2} 0 0 ${sex} ; } | echo_out ; }
+
+send_char_select() { hex $( id2hex "${CMSG_CHAR_SELECT}" ) "${charslot}" \
+    | echo_out ; }
+
+parse_char_map_info() { 
+    charid=$( slice 2 4 ); map_port=$( hex $( slice 27 2 ) | od -An -td2 ) ; }
+
+send_map_server_connect() { { hex $( id2hex "${CMSG_MAP_SERVER_CONNECT}" ) \
+    ${accid} ${charid} ${id1} ${id2} ${sex} ; } | echo_out ; }
+
+send_map_loaded() { hex $( id2hex "${CMSG_MAP_LOADED}" ) | echo_out ; }
+
+# 1 -- nick
+# 2 -- message
+send_chat_whisper() {
+    len=$( dec2hex $(( $( printf "%s" "$2" | wc -c ) + 28 )) )
+    echo_service whisper nick $1 msg $2 len ${len}
+    { hex $( id2hex "${CMSG_CHAT_WHISPER}" ) ${len}
+    pad 24 "$1"; printf "%s" "$2"; } | echo_out ; }
+
+# newlines in whisper body are replaced with spaces
+parse_whisper() { nick=$( string 4 24 ); msg=$( string 28 | tr '\n' ' ' | sed 's/##.//g' ); }
+
+# newlines in chat body are replaced with spaces
+parse_player_chat() { msg=$( string 4 | tr '\n' ' ' ) ; }
+
+send_ping() { hex $( id2hex "${CMSG_NAME_REQUEST}" ) ${accid} | echo_out ; }
+
+# 1 -- id
+send_name_request() { hex $( id2hex "${CMSG_NAME_REQUEST}" ) $1 | echo_out ; }
+
+parse_being_remove() { being_id=$( slice 2 4 ) ; }
+
+# one of 119 1d7 or 1d9 should work c:
+# parse_player_status_change() { being_id=$( slice 2 4 ); }
+# parse_player_update_2() { being_id=$( slice 2 4 ); }
+parse_being_change_looks2() { being_id=$( slice 2 4 ); }
+
+parse_being_name_response() { being_id=$( slice 2 4 ); being_name=$( string 6 ) ; }
+
+# 1 -- msg
+send_chat_message() {
+    len=$( dec2hex $(( $( printf "%s : %s" "${charname}" "$1" | wc -c ) + 4 )) )
+    echo_service public msg $1 len ${len}
+    { hex $( id2hex "${CMSG_CHAT_MESSAGE}" ) ${len} ;
+    printf "%s : %s" "${charname}" "$1" ; } | echo_out ; }
+
+parse_being_chat() { being_id=$( slice 4 4 ) ; msg=$( string 8 | sed 's/##.//g' ) ;
+    nick=$( printf "%s\n" "${players}" | sed -n "s/^${being_id} //p" )
+    unrecognized=; [ -z "${nick}" ] && unrecognized=1
+    nick="${nick:-${being_id}}" ; }
+
+send_sit() { hex $( id2hex "${CMSG_PLAYER_CHANGE_ACT}" ) 0 0 0 0 2 | echo_out ; }
+
+# 1 -- emote hex
+send_emote() { hex $( id2hex "${CMSG_PLAYER_EMOTE}" ) "$1" | echo_out ; }
+
+parse_gm_chat() { msg=$( string 4 | tr '\n' ' ' | sed 's/##.//g' ); }
+
+#
+# aux
+#
+#
+
+notify_i() { if [ -n "${console_i}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_g() { if [ -n "${console_g}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_p() { if [ -n "${console_p}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_w() { if [ -n "${console_w}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_m() { if [ -n "${console_m}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_h() { if [ -n "${console_h}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_r() { if [ -n "${console_r}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_o() { if [ -n "${console_o}" ]; then printf "%s\n" "$1" ; fi ; }
+notify_b() { if [ -n "${console_b}" ]; then printf "%s\n" "$1" ; fi ; }
+
+make_csv() { ${AWK} -- '{if (FNR != 1) printf ", "; printf "%s",$0}' ; }
+escape_ere() { printf "%s" "$1" | sed -r 's/\\/\\\\/g;s/([.*"+!@#$%^/?[{|()])/\\\1/g'; }
+
+prepare_visible() {
+    count=$( printf "%s\n" "${visible}" | wc -l )
+    # name resolution for visible ids
+    nicks=$( printf "%s\n" "${visible}" | while read -r n; do
+        [ -z "$n" ] && continue
+        r=$( printf "%s\n" "${players}" | sed -n "s/^ ${n} //p" )
+        printf "%s\n" "${r:-${n}}" ; done )
+    nicks=$( printf "%s\n" "${nicks}" | make_csv )
+}
+
+# validate and apply command sent over whisper
+whisper_command() {
+    orig="${msg}"
+    esc_nick=$( escape_ere "${nick}" )
+    if printf "%s\n%s\n" "${master}" "${hub}" | egrep -q "^${esc_nick}$" 2>/dev/null ; then
+        if [ "${nick}" != "${hub}" ]; then
+            notify_m "~m \"${nick}\": ${msg}"
+            # return after each match
+            case "${msg}" in
+                .x*)
+                    # forward
+                    printf "%s\n" "${msg}" > "${fifo}"
+                    return 0 ;;
+                .m)
+                    # send master relay status to nick
+                    mode="${master_p:+p}${master_w:+w}${master_h:+h}${master_v:+v}"
+                    printf ".w \"%s\" ~i master relay status: %s\n" "${nick}" "${mode:-empty}" > "${fifo}"
+                    return 0 ;;
+                .m*)
+                    # local master redirection settings
+                    set_master_relay_mode "${msg#???}"
+                    return 0 ;;
+                .u)
+                    # local copy for redirection
+                    active_master="${nick}"
+                    return 0 ;;
+            esac
+        else
+            notify_h "~h \"${nick}\" ${msg}"
+            if [ -n "${hub_skip_prefix}" ]; then
+                msg=".${msg#*: .}"
+            fi
+        fi
+        case "${msg}" in
+            .[bswae]*)
+                # forward stripped msg to common console/whisper fifo handler
+                printf "%s\n" "${msg}" > "${fifo}"
+                return 0 ;;
+            .l)
+                # .l handler is different than for console
+                prepare_visible
+                printf ".w \"%s\" visible: %s - %s\n" "${nick}" "${count}" \
+                    "${nicks}" > "${fifo}"
+                return 0 ;;
+            .r)
+                # send hub relay status to nick
+                mode="${relay_p:+p}${relay_w:+w}"
+                printf ".w \"%s\" ~i hub relay status %s\n" "${nick}" "${mode:-empty}" > "${fifo}"
+                return 0 ;;
+            .r*)
+                # local hub redirection settings
+                set_hub_relay_mode "${msg#???}"
+                return 0 ;;
+            .h)
+                printf ".w \"%s\" %s %s %s %s\n" "${nick}" "~i help: (whisper)" \
+                ".w \"NICK\" MSG; (anon talk) .a MSG; (emote) .e HEX;" \
+                "(dump visible) .l; (relay get/set) .r [[pwv]] -- p=pub2hub," \
+                "w=whisper2hub, v=visible2hub, default: pw" > "${fifo}"
+                return 0 ;;
+        esac
+        # end of master/hub remote commands
+        if [ "${nick}" = "${hub}" ]; then
+            if [ -n "${master_h}" -a -n "${active_master}" ]; then
+                printf ".w \"%s\" ~h %s\n" "${active_master}" "${orig}" > "${fifo}"
+                notify_o "~o hub \"${active_master}\" ${orig}"
+            fi
+            if [ -n "${shmn_hub}" ]; then
+                printf "%s\n" "${orig}" > "${hub_fifo}"
+            fi
+        fi
+        # unrecognized master messages are skipped
+        # use .x to pass to hub
+    else
+        # whisper not recognized as master or hub
+        notify_w "~w \"${nick}\" ${msg}"
+        if [ -n "${relay_w}" ]; then
+            printf ".w \"%s\" ~w %s: %s\n" "${hub}" "${nick}" "${msg}" > "${fifo}"
+            notify_r "~r msg \"${hub}\" ${nick}: ${msg}"
+        fi
+        if [ -n "${master_w}" -a -n "${active_master}" ]; then
+            printf ".w \"%s\" ~w %s: %s\n" "${active_master}" "${nick}" "${msg}" > "${fifo}"
+            notify_o "~o msg \"${active_master}\" ${nick}: ${msg}"
+        fi
+    fi
+}
+
+# 1 -- balance fifo
+route() {
+    notify_b "~b $1 ${line}"
+    printf "%s\n" "${line}" > "$1"
+}
+
+set_hub_relay_mode() {
+    relay_p= ; relay_w=; relay_v=
+    case "$1" in *p*) relay_p=1 ;; esac
+    case "$1" in *w*) relay_w=1 ;; esac
+    case "$1" in *v*) relay_v=1 ;; esac
+}
+
+set_master_relay_mode() {
+    master_p= ; master_w=; master_h=; master_v=
+    case "$1" in *p*) master_p=1 ;; esac
+    case "$1" in *w*) master_w=1 ;; esac
+    case "$1" in *h*) master_h=1 ;; esac
+    case "$1" in *v*) master_v=1 ;; esac
+}
+
+check_chat_spam() {
+    if [ -f "${spam_chat}" ]; then
+        if [ $(( $( date +%s ) - $( stat -c %Z "${spam_chat}" ) )) \
+            -gt "${penalty_chat}" ]; then
+                rm -f "${spam_chat}"
+                # clearing temporary buffer
+                msg_buffer=
+        fi
+        # extra bot fifo for balancing whisper queue
+        # route aux1
+        # placing line in buffer when not using 
+        msg_buffer="${line}"
+        sleep 0.2
+        return 1
+    fi
+}
+
+# validate and apply command taken from fifo
+# care about spam protection
+output_command() {
+    case "${line}" in
+        .w*)
+            check_chat_spam || return
+            printf "%s\n" "${line}"
+            msg_buffer=
+            # forward stripped msg to common console/whisper fifo handler
+            msg="${line#*\"}"; nick="${msg%%\"*}"
+            # limit chat line to 470 bytes; broken UTF possible
+            msg=$( printf "%s" "${msg#*\" }" | cut -b 1-470 )
+            [ -z "${msg}" ] && return
+            send_chat_whisper "${nick}" "${msg}"
+            sleep "${delay_chat}"
+            ;;
+        .a*)
+            check_chat_spam || return
+            printf "%s\n" "${line}"
+            msg_buffer=
+            msg=$( printf "%s" "${line#???}" | cut -b 1-470 )
+            [ -z "${msg}" -o "${msg}" = ".a" ] && return
+            send_chat_message "${msg}"
+            sleep "${delay_chat}"
+            ;;
+        .x*)
+            check_chat_spam || return
+            printf "%s\n" "${line}"
+            msg_buffer=
+            msg=$( printf "%s" "${line#???}" | cut -b 1-470 )
+            [ -z "${msg}" ] && return
+            send_chat_whisper "${nick}" "${msg}"
+            sleep "${delay_chat}"
+            ;;
+        .b) printf '\07' ;;
+        ".e "??) send_emote "${line#???}" ;;
+        .t) printf "~i target: %s\n" "${target}" ;;
+        .t*) target="${line#???}" ;;
+        .f) printf "~i safe default target: %s\n" "${safe_default:-0}" ;;
+        ".f 0") safe_default= ;;
+        ".f 1") safe_default=1 ;;
+        .l)
+            prepare_visible
+            printf "~i visible: %s - %s\n" "${count}" "${nicks}"
+            ;;
+        .d*)
+            check_chat_spam || return
+            printf "%s\n" "${line}"
+            line="${line#???}"
+            case "${target}" in
+                pub) send_chat_message "${line}" ;;
+                *) send_chat_whisper "${target}" "${line}" ;;
+            esac
+            sleep "${delay_chat}"
+            ;;
+        .c)
+            mode="${console_i:+i}${console_g:+g}${console_p:+p}${console_w:+w}${console_m:+m}"
+            mode="${mode}${console_h:+h}${console_r:+r}${console_b:+b}${console_o:+o}"
+            printf "~i console mode: %s\n" "${mode}"
+            ;;
+        .c*)
+            msg="${line#* }"
+            console_i= ; console_p=; console_w=; console_m=;
+            console_h=; console_r=; console_b=; console_o=
+            case "${line}" in *i*) console_i=1 ;; esac
+            case "${line}" in *g*) console_g=1 ;; esac
+            case "${line}" in *p*) console_p=1 ;; esac
+            case "${line}" in *w*) console_w=1 ;; esac
+            case "${line}" in *m*) console_m=1 ;; esac
+            case "${line}" in *h*) console_h=1 ;; esac
+            case "${line}" in *r*) console_r=1 ;; esac
+            case "${line}" in *o*) console_o=1 ;; esac
+            case "${line}" in *b*) console_b=1 ;; esac
+            ;;
+        # added sleep trying to figure out what causes failure
+        .s) sleep 0.05; send_sit; sleep 0.05 ;;
+        # internal commands
+        # ask player name by id
+        ".p i"*) line="${line#?????}"
+            echo_service "sending name request for ${line}"
+            if [ "${line}" != "${accid}" -o -z "${asked_self}" ]; then
+                send_name_request "${line}"
+                [ "${line}" = "${accid}" ] && asked_self=1
+            fi
+            ;;
+        # add to visible
+        ".p e"*)
+            if ! printf "%s\n" "${visible}" | grep -q "${line#?????}" 2>/dev/null; then
+                visible="${visible}${nl}${line#?????}"
+            fi
+            ;;
+        # del from visible
+        ".p E"*)
+            visible=$( printf "%s\n" "${visible}" | grep -v "${line#?????}" 2>/dev/null )
+            ;;
+        # update local copy of players list (id/name)
+        ".p I"*)
+            line="${line#?????}"; being_id="${line%% : *}"
+            being_name="${line#* : }"
+            if ! printf "%s\n" "${players}" | grep -q "^${being_id}" 2>/dev/null; then
+                players=$( printf "%s\n%s\n" "${players}" "${being_id} ${being_name}" |
+                tail -n "${cached_ids_limit}" )
+            fi
+            if [ "${being_id}" = "${accid}" ]; then
+                echo_service "pong!"
+                self_ping=
+            fi
+            ;;
+        # notify server about loaded map
+        ".p w") send_map_loaded ;;
+        *)  
+            [ -z "${safe_default}" ] || return
+            check_chat_spam || return
+            printf "%s\n" "${line}"
+            line="${line#???}"
+            case "${target}" in
+                pub) send_chat_message "${line}" ;;
+                *) send_chat_whisper "${target}" "${line}" ;;
+            esac
+            ;;
+    esac
+}
+
+#
+# main
+#
+#
+
+trap 'rm -f "${pid_file}" "${rlfile}" "${fifo}" "${raw_in}" "${raw_out}";
+    kill -9 0' INT TERM EXIT
+
+connect
+
+send_login_register "${login}" "${password}"
+expect $SMSG_LOGIN_DATA $SMSG_LOGIN_ERROR
+[ "${packet_id}" = "${SMSG_LOGIN_ERROR}" ] && fatal "Login error"
+parse_login_data
+
+disconnect
+connect "${char_port}"
+
+send_char_server_connect
+# it may brick here if didn't exit properly (and shmn doesn't exit properly)
+# FIXME add timeout to expect
+expect $SMSG_CHAR_LOGIN
+send_char_select
+expect $SMSG_CHAR_MAP_INFO
+parse_char_map_info
+
+disconnect
+connect "${map_port}"
+
+send_map_server_connect
+expect $SMSG_MAP_LOGIN_SUCCESS
+send_map_loaded
+
+[ -p "${fifo}" ] && { rm -f "${fifo}" || fatal "Can't reuse fifo!" ; }
+mkfifo "${fifo}"
+if [ -n "${shmn_hub}" ]; then
+    [ -p "${hub_fifo}" ] && { rm -f "${hub_fifo}" || fatal "Can't reuse fifo!" ; }
+    mkfifo "${hub_fifo}"
+fi
+if [ -n "${shmn_pub}" ]; then
+    [ -p "${pub_fifo}" ] && { rm -f "${pub_fifo}" || fatal "Can't reuse fifo!" ; }
+    mkfifo "${pub_fifo}"
+fi
+
+# init
+visible="${accid}"
+nl=$(printf "\n "); nl="${nl% }"
+
+# TODO reorganize timeout same way as "sit" action
+# output queue
+(
+    exec 3<>"${fifo}"
+    while :; do
+        # see output_command processing for detail on msg_buffer
+        if [ -n "${msg_buffer}" ]; then
+            line="${msg_buffer}"
+        else
+            line=$( timeout 1 line )
+        fi
+        echo_service "fifo_line: _${line}_"
+        if [ -z "${line}" ]; then
+            if [ -z "${self_ping}" ]; then
+                # send ping only if there is nothing more to do
+                # and if previous ping arrived
+                echo_service 'ping!'
+                sleep 0.1
+                send_ping
+                self_ping=1
+            fi
+        else
+            output_command
+            sleep 0.05
+        fi
+    done <&3
+    echo "Fatal: output listener bricked!"
+    echo "fifo trace:"
+    cat "${fifo}"
+    echo 'done.'
+) 2>/dev/null &
+
+sleep 1
+
+# TODO at this point add possible external script
+
+# sit every N seconds
+( while :; do sleep "${sit_delay}"; echo '.s' > "${fifo}"; done ; ) &
+
+# input queue
+(
+exec 3<>"${raw_in}"
+while :; do
+    read packet <&3
+    packet_id="${packet%% *}"
+    case "${packet_id}" in
+        # player appear -> add to visible, check name
+        # ${SMSG_PLAYER_UPDATE_2})
+        # ${SMSG_PLAYER_STATUS_CHANGE})
+        ${SMSG_BEING_CHANGE_LOOKS2})
+            parse_being_change_looks2
+            echo_service new_being "${being_id}"
+            if ! printf "%s\n" "${visible}" | grep -q "${being_id}" 2>/dev/null; then
+                echo_service add as visible
+                visible="${visible}${nl}${being_id}"
+            fi
+            nick=$( printf "%s\n" "${players}" | sed -n "s/^${being_id} //p" )
+            # skip duplicates in row
+            if [ "${being_id}" != "${prev_being}" ]; then
+                if [ -z "${nick}" ]; then
+                    # queue player name request
+                    echo_service request name
+                    printf ".p i ${being_id}\n" > "${fifo}"
+                fi
+                nick="${nick:-${being_id}}"
+                printf ".p e ${being_id}\n" > "${fifo}"
+                if [ -n "${relay_v}" ]; then
+                    printf ".w \"%s\" ~v enter %s\n" "${hub}" "${nick}" > "${fifo}"
+                    notify_r "~v enter \"${hub}\" ${nick}"
+                fi
+                if [ -n "${master_v}" -a -n "${active_master}" ]; then
+                    printf ".w \"%s\" ~v enter %s\n" "${active_master}" "${nick}" > "${fifo}"
+                    notify_r "~v enter \"${active_master}\" ${nick}"
+                fi
+                prev_being="${being_id}"
+            fi
+            ;;
+        # cache player name
+        ${SMSG_BEING_NAME_RESPONSE})
+            parse_being_name_response
+            echo_service name response "${being_id}" "${being_name}"
+            if ! printf "%s\n" "${players}" | grep -q "^${being_id}" 2>/dev/null; then
+                players=$( printf "%s\n%s\n" "${players}" "${being_id} ${being_name}" |
+                    tail -n "${cached_ids_limit}" )
+                # dirty fix due to restricted to subshell variable scope
+                printf ".p I ${being_id} : %s\n" "${being_name}" > "${fifo}"
+            elif [ "${being_id}" = "${accid}" ]; then
+                printf ".p I ${being_id} : %s\n" "${being_name}" > "${fifo}"
+            fi
+            ;;
+        # player disappear -> remove from visible
+        ${SMSG_BEING_REMOVE})
+            parse_being_remove
+            tp=$( slice 5 1 )
+            if [ "${tp}" = " 00" ]; then
+                visible=$( printf "%s\n" "${visible}" | grep -v "${being_id}" 2>/dev/null )
+                printf ".p E ${being_id}\n" > "${fifo}"
+                nick=$( printf "%s\n" "${players}" | sed -n "s/^${being_id} //p" )
+                nick="${nick:-${being_id}}"
+                if [ -n "${relay_v}" ]; then
+                    printf ".w \"%s\" ~v exit %s\n" "${hub}" "${nick}" > "${fifo}"
+                    notify_r "~v exit \"${hub}\" ${nick}"
+                fi
+                if [ -n "${master_v}" -a -n "${active_master}" ]; then
+                    printf ".w \"%s\" ~v exit %s\n" "${active_master}" "${nick}" > "${fifo}"
+                    notify_r "~v exit \"${active_master}\" ${nick}"
+                fi
+            fi
+            ;;
+        ${SMSG_BEING_CHAT})
+            parse_being_chat
+            if [ -n "${unrecognized}" ]; then
+                printf ".p i ${being_id}\n" > "${fifo}"
+            fi
+            notify_p "~p \"${nick}\" ${msg}"
+            if [ -n "${relay_p}" ]; then
+                printf ".w \"%s\" ~p %s: %s\n" "${hub}" "${nick}" "${msg}" > "${fifo}"
+                notify_r "~r pub \"${hub}\" ${nick}: ${msg}"
+            fi
+            if [ -n "${master_p}" -a -n "${active_master}" ]; then
+                printf ".w \"%s\" ~p %s: %s\n" "${active_master}" "${nick}" "${msg}" > "${fifo}"
+                notify_o "~o pub \"${active_master}\" ${nick}: ${msg}"
+            fi
+            if [ -n "${shmn_pub}" ]; then
+                printf "\"%s\" %s\n" "${nick}" "${msg}" > "${pub_fifo}"
+            fi
+            ;;
+        # incoming whisper
+        ${SMSG_WHISPER})
+            parse_whisper
+            whisper_command
+            ;;
+        # map changed, e.g. on @recall
+        ${SMSG_PLAYER_WARP})
+            # queue "map loaded" response
+            printf ".p w\n" > "${fifo}"
+            ;;
+        # chat penalty / spam protection
+        ${SMSG_PLAYER_CHAT})
+            parse_player_chat
+            case "${msg}" in
+                *"automatically banned for spam"*) : ;;
+                *"do not SHOUT"*) : ;;
+                *"have been banned"*) fatal "Banned for chat spam" ;;
+                *) continue ;;
+            esac
+            notify_i "~i Server message: ${msg}"
+            touch "${spam_chat}"
+            ;;
+        ${SMSG_WHISPER_RESPONSE})
+            packet="${packet#????}"
+            if [ "${packet}" != " 00 " ]; then
+                notify_i "~i Whisper failed with code: ${packet}"
+            fi
+            ;;
+        ${SMSG_GM_CHAT})
+            parse_gm_chat
+            notify_g "~g ${msg}"
+            ;;
+    esac
+done
+echo 'Epic fail.'
+) 2>/dev/null &
+
+if [ -n "${shmn_cat}" ]; then
+    cat > "${fifo}"
+elif [ -n "${shmn_readline}" ]; then
+    run_readline
+else
+    wait
+    echo_service "Totally unexpected event."
+fi
+

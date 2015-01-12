@@ -1,0 +1,166 @@
+Name
+----
+shamana - tmwa ghetto bot engine made with POSIX shell
+
+Synopsis
+--------
+
+shamana [-acr] [-i INPUTFIFO] [-f CONFIG] ARG*
+
+Description
+-----------
+
+All ur cave r belong to us!
+
+.Features
+
+- remote control
+- whisper/public chat redirection & anon talk
+- spam protection
+- chat balancing (redirecting overload to local pipe)
+- appear/disappear notification
+- chat from console
+
+Options
+-------
+
+-i INPUTFIFO    :: input fifo (default: "in")
+-a              :: attach to given/default fifo of running instance
+-c              :: attach with cat
+-r              :: attach with tcc/readline "script"
+-f CONFIG       :: optional config file overriding default settings
+-h              :: enable unrecognized hub whispers fifo (requires attached listener)
+-p              :: enable public messages fifo (requires attached listener)
+-k FILE         :: tail -f + kolorize target shit_sink
+-b BALANCE      :: balance fifo
+-y FILE         :: file containing pid of main process
+ARG             :: if not empty - echo all args to running instance
+
+Usage
+-----
+
+    $ shmn -i pipe -f ./willee >shit_sink &
+
+Default INPUTFIFO is called "in". Use separate terminals/terminal multiplexer
+for reading/sending messages. Note that console ".w" commands are not logged to
+shit_sink. Reading examples (remember to flush it or use fifo with listener):
+
+    $ tail -f shit_sink
+    $ shmn -k shit_sink
+
+Writing example:
+
+    $ cat > in
+
+Or if you want to reuse readline capabilities pipe it to irc, use socat or if
+like in debian your socat has no readline, try this (optionally using -i ):
+
+    $ shmn -ar
+
+which will run "tcc -lreadline -run tmp_rl.c 2>INPUTFIFO" (tmp_rl.c created
+with mktemp on demand).
+
+.Terms
+
+master  :: nick recognized as master (multiple masters possible)
+hub     :: target nick for relaying messages
+
+Available relaying:
+
+- public to hub
+- whispers to hub
+- public to one of master's nick
+- whispers to one of master's nick
+- hub to one of master's nick
+
+NOTE:   output is still limited to N messages per second with spam penalty,
+        unless you set up bot cascade
+
+.Commands
+
+permission: console
+
+    .c [[igpwmhrb]] -- request/set console verbosity level, default: ipwmhrb
+    .t [ pub | nick NICK ] -- request/set default message target: pub(default)/nick
+    .f [0|1] -- check/set status of safe default target
+    .d -- safe talk to default target
+
+Thing with default target is next: with console you can skip typing .w or .a
+commands using default target as nick or "pub", setting e as 1 fill prohibit
+unrecognized command/plain text on console sent to default target and will
+require .d prefix.
+
+permission: console, master
+
+    .x -- talk to hub shortcut
+
+permission: master
+
+    .m [[pwhv]] -- get/set master relay mode: pub, whisper, hub msgs, visible; default: empty
+    .u -- attention whoring (select master char accepting redirections)
+
+Without active master master redirection will not take place.
+
+permission: console, master, hub
+
+    .w "NICK" MESSAGE -- whisper NICK with MESSAGE
+    .a MESSAGE -- anon talk (to public)
+    .e HEX -- use emote (7e for trollface)
+    .l -- dump visible players
+
+permission: master, hub
+
+    .r [[pwv]] -- get/set hub relay mode: p=pub2hub, w=whisper2hub, v=visible2hub, default: pw
+    .h -- short help
+
+Commands are recognized by rightmost ": ." sequence.
+
+.Console output prefixes
+
+    ~i -- bot info (e.g. spam warnings)
+    ~g -- globel announce
+    ~p -- public message
+    ~w -- whisper
+    ~m -- whisper recognized as master
+    ~h -- whisper recognized as hub message
+    ~r -- hub relayed whisper
+    ~o -- master relayed whisper
+    ~b -- routed (balanced) message
+
+.Cascading bots
+
+With additional bots you can multiply whispers/public messages rate
+pointing to next in cascade bot fifo with -b option.
+
+.Hub and pub fifos
+
+Messages should be prefixed with .h or .a and sent to main fifo.
+
+Files
+-----
+
+Here you see default names.
+
+in          :: commands fifo (used internally and accessible from console)
+raw_in      :: binary flow sent to netcat, should not be used directly
+raw_out     :: input packets dumped in hex, packet per line
+spam_chat   :: file used as timestamp for chat warnings
+hub_chat    :: unprocessed hub messages
+pub_chat    :: unprocessed pub messages
+
+rl_XXXXXX.c :: readline temporary file
+
+Bugs
+----
+Using whispers as command line arguments should make your pants wet. Setting
+relay modes and ignore list won't work from console if done - no way (except
+passing special messages to raw_in) to sync values between input/output
+listeners.
+
+Output is kinda spammy. By default -k will not only colorize but filter
+anything except "~X" messages.
+
+Authors
+-------
+willee <v4r@trioptimum.com>, 2015
+
